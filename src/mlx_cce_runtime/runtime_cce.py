@@ -532,9 +532,15 @@ def make_runtime_cce_loss_fused_finalize(
 
     ignore_arr = mx.array([ignore_index], dtype=mx.int32)
     softcap_arr = mx.array([logit_softcap], dtype=mx.float32)
-    chunk_plan_cache: dict[tuple[int, int], tuple[int, list[int], list[mx.array]]] = {}
+    chunk_plan_cache: dict[
+        tuple[int, int],
+        tuple[int, list[int], list[mx.array], list[mx.array]],
+    ] = {}
 
-    def get_chunk_plan(hidden: mx.array, weight: mx.array) -> tuple[int, list[int], list[mx.array]]:
+    def get_chunk_plan(
+        hidden: mx.array,
+        weight: mx.array,
+    ) -> tuple[int, list[int], list[mx.array], list[mx.array]]:
         n_tokens = hidden.shape[0]
         vocab_size = weight.shape[0]
         key = (n_tokens, vocab_size)
@@ -550,7 +556,8 @@ def make_runtime_cce_loss_fused_finalize(
         )
         starts = list(range(0, vocab_size, resolved_chunk_size))
         start_arrays = [mx.array([v_start], dtype=mx.int32) for v_start in starts]
-        chunk_plan_cache[key] = (resolved_chunk_size, starts, start_arrays)
+        weight_start_arrays = [mx.array([v_start, 0], dtype=mx.int32) for v_start in starts]
+        chunk_plan_cache[key] = (resolved_chunk_size, starts, start_arrays, weight_start_arrays)
         return chunk_plan_cache[key]
 
     if quantized:
@@ -591,7 +598,7 @@ def make_runtime_cce_loss_fused_finalize(
                 grad_output = mx.zeros_like(outputs[0])
             grad_output32 = grad_output.astype(mx.float32)
 
-            resolved_chunk_size, chunk_starts_int, chunk_starts_arr = get_chunk_plan(hidden, weight)
+            resolved_chunk_size, chunk_starts_int, chunk_starts_arr, _ = get_chunk_plan(hidden, weight)
             vocab_size = weight_compute.shape[0]
             lse = outputs[1].astype(mx.float32)
 
@@ -706,12 +713,15 @@ def make_runtime_cce_loss_fused_finalize(
             grad_output = mx.zeros_like(outputs[0])
         grad_output32 = grad_output.astype(mx.float32)
 
-        resolved_chunk_size, chunk_starts_int, chunk_starts_arr = get_chunk_plan(hidden, weight)
+        resolved_chunk_size, chunk_starts_int, chunk_starts_arr, weight_chunk_starts = get_chunk_plan(
+            hidden,
+            weight,
+        )
         vocab_size = weight_compute.shape[0]
         lse = outputs[1].astype(mx.float32)
 
         grad_hidden = mx.zeros_like(hidden_compute)
-        grad_weight_chunks = []
+        grad_weight = mx.zeros(weight_compute.shape, dtype=hidden_compute.dtype)
         n_reads = 4
 
         for chunk_idx, v_start in enumerate(chunk_starts_int):
@@ -752,9 +762,14 @@ def make_runtime_cce_loss_fused_finalize(
 
             d_logits_compute = d_logits.astype(hidden_compute.dtype)
             grad_hidden = grad_hidden + d_logits_compute @ weight_chunk
-            grad_weight_chunks.append(d_logits_compute.T @ hidden_compute)
+            grad_weight_chunk = d_logits_compute.T @ hidden_compute
+            grad_weight = mx.slice_update(
+                grad_weight,
+                grad_weight_chunk,
+                start_indices=weight_chunk_starts[chunk_idx],
+                axes=(0, 1),
+            )
 
-        grad_weight = mx.concatenate(grad_weight_chunks, axis=0)
         return grad_hidden.astype(hidden.dtype), grad_weight.astype(weight.dtype), mx.zeros_like(targets)
 
     def runtime_cce_loss(hidden: mx.array, weight: mx.array, targets: mx.array) -> mx.array:
