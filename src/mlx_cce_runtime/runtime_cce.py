@@ -2,14 +2,24 @@
 
 """Chunked cross-entropy helpers built from MLX runtime custom kernels."""
 
+import os
 from typing import Callable
 
 import mlx.core as mx
+
+try:
+    from . import _ext as _native_ext
+except ImportError:
+    _native_ext = None
 
 __all__ = [
     "make_chunked_cross_entropy_loss",
     "make_runtime_cce_loss_fused_finalize",
 ]
+
+
+def _native_runtime_enabled() -> bool:
+    return os.environ.get("MLX_CCE_RUNTIME_USE_NATIVE", "0") == "1"
 
 
 def _resolve_chunk_size(
@@ -712,13 +722,29 @@ def make_runtime_cce_loss_fused_finalize(
         if grad_output is None:
             grad_output = mx.zeros_like(outputs[0])
         grad_output32 = grad_output.astype(mx.float32)
+        lse = outputs[1].astype(mx.float32)
+
+        if _native_ext is not None and _native_runtime_enabled() and mx.metal.is_available():
+            grad_hidden, grad_weight = _native_ext.dense_cce_backward(
+                hidden_compute,
+                weight_compute,
+                targets32,
+                grad_output32,
+                lse,
+                ignore_index=ignore_index,
+                logit_softcap=logit_softcap,
+            )
+            return (
+                grad_hidden.astype(hidden.dtype),
+                grad_weight.astype(weight.dtype),
+                mx.zeros_like(targets),
+            )
 
         resolved_chunk_size, chunk_starts_int, chunk_starts_arr, weight_chunk_starts = get_chunk_plan(
             hidden,
             weight,
         )
         vocab_size = weight_compute.shape[0]
-        lse = outputs[1].astype(mx.float32)
 
         grad_hidden = mx.zeros_like(hidden_compute)
         grad_weight = mx.zeros(weight_compute.shape, dtype=hidden_compute.dtype)

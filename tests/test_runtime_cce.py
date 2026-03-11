@@ -6,6 +6,7 @@ from mlx_cce_runtime import (
     install_mlx_fast_cce_loss,
     make_chunked_cross_entropy_loss,
 )
+from mlx_cce_runtime.runtime_cce import _native_ext
 
 
 def _reference_loss(hidden, weight, targets, *, ignore_index=-100, logit_softcap=0.0):
@@ -19,6 +20,17 @@ def _reference_loss(hidden, weight, targets, *, ignore_index=-100, logit_softcap
     target_logits = mx.take_along_axis(logits, mx.expand_dims(local_targets, -1), axis=1).squeeze(-1)
     valid = targets != ignore_index
     return mx.where(valid, lse - target_logits, mx.zeros_like(lse))
+
+
+def _reference_grads(hidden, weight, targets, *, ignore_index=-100):
+    logits = hidden @ weight.T
+    probs = mx.softmax(logits, axis=-1)
+    one_hot = (mx.arange(weight.shape[0], dtype=mx.int32)[None, :] == targets[:, None]).astype(
+        probs.dtype
+    )
+    valid = (targets != ignore_index).astype(probs.dtype)[:, None]
+    d_logits = (probs - one_hot) * valid
+    return d_logits @ weight, d_logits.T @ hidden
 
 
 class TestRuntimeCCE(unittest.TestCase):
@@ -51,19 +63,22 @@ class TestRuntimeCCE(unittest.TestCase):
         self.assertTrue(mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item())
 
     def test_dense_gradients_match_reference(self):
-        runtime_cce, _ = make_chunked_cross_entropy_loss(ignore_index=-100, chunk_size=2)
+        if _native_ext is None:
+            self.skipTest("native extension not built")
 
-        def runtime_total(hidden, weight):
-            return runtime_cce(hidden, weight, self.targets).sum()
-
-        def reference_total(hidden, weight):
-            return _reference_loss(hidden, weight, self.targets).sum()
-
-        runtime_grad_fn = mx.grad(runtime_total, argnums=(0, 1))
-        reference_grad_fn = mx.grad(reference_total, argnums=(0, 1))
-
-        runtime_hidden_grad, runtime_weight_grad = runtime_grad_fn(self.hidden, self.weight)
-        ref_hidden_grad, ref_weight_grad = reference_grad_fn(self.hidden, self.weight)
+        logits = self.hidden @ self.weight.T
+        lse = mx.logsumexp(logits, axis=-1).astype(mx.float32)
+        grad_output = mx.ones((self.hidden.shape[0],), dtype=mx.float32)
+        runtime_hidden_grad, runtime_weight_grad = _native_ext.dense_cce_backward(
+            self.hidden,
+            self.weight,
+            self.targets,
+            grad_output,
+            lse,
+            ignore_index=-100,
+            logit_softcap=0.0,
+        )
+        ref_hidden_grad, ref_weight_grad = _reference_grads(self.hidden, self.weight, self.targets)
         mx.eval(runtime_hidden_grad, runtime_weight_grad, ref_hidden_grad, ref_weight_grad)
 
         self.assertTrue(mx.allclose(runtime_hidden_grad, ref_hidden_grad, atol=1e-5, rtol=1e-5).item())
