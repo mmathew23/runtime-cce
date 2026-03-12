@@ -22,6 +22,7 @@ _RUNTIME_VARIANT_ALIASES = {
     "fused_finalize": "clean",
     "iter": "iter",
     "simd": "simd",
+    "native_bridge": "native_bridge",
 }
 
 
@@ -671,6 +672,9 @@ def _build_kernel_set(runtime_variant: str) -> tuple[Callable | None, Callable |
             runtime_variant,
         )
 
+    if runtime_variant == "native_bridge":
+        return None, None, None, runtime_variant
+
     return (
         _build_forward_update_kernel(),
         _build_forward_update_finalize_kernel(),
@@ -1041,6 +1045,16 @@ def make_runtime_cce_loss_fused_finalize(
             grad_output = mx.zeros_like(outputs[0])
         grad_output32 = grad_output.astype(mx.float32)
         lse = outputs[1].astype(mx.float32)
+
+        if runtime_variant == "native_bridge" and _native_ext is not None and mx.metal.is_available():
+            losses, _ = _native_ext.dense_cce_loss_custom(
+                hidden,
+                weight,
+                targets.astype(mx.int32),
+                ignore_index=ignore_index,
+                logit_softcap=logit_softcap,
+            )
+            return losses
 
         if _native_ext is not None and _native_runtime_enabled() and mx.metal.is_available():
             grad_hidden, grad_weight = _native_ext.dense_cce_backward(

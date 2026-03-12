@@ -14,6 +14,50 @@ NB_MODULE(_ext, m) {
   m.doc() = "Native helpers for mlx-cce-runtime";
 
   m.def(
+      "dense_cce_loss",
+      &mlx_cce_runtime_ext::dense_cce_loss,
+      "hidden"_a,
+      "weight"_a,
+      "targets"_a,
+      nb::kw_only(),
+      "ignore_index"_a = -100,
+      "logit_softcap"_a = 0.0f,
+      "stream"_a = nb::none());
+
+  m.def(
+      "dense_cce_loss_single",
+      &mlx_cce_runtime_ext::dense_cce_loss_single,
+      "hidden"_a,
+      "weight"_a,
+      "targets"_a,
+      nb::kw_only(),
+      "ignore_index"_a = -100,
+      "logit_softcap"_a = 0.0f,
+      "stream"_a = nb::none());
+
+  m.def(
+      "dense_cce_loss_custom",
+      &mlx_cce_runtime_ext::dense_cce_loss_custom,
+      "hidden"_a,
+      "weight"_a,
+      "targets"_a,
+      nb::kw_only(),
+      "ignore_index"_a = -100,
+      "logit_softcap"_a = 0.0f,
+      "stream"_a = nb::none());
+
+  m.def(
+      "dense_cce_loss_single_custom",
+      &mlx_cce_runtime_ext::dense_cce_loss_single_custom,
+      "hidden"_a,
+      "weight"_a,
+      "targets"_a,
+      nb::kw_only(),
+      "ignore_index"_a = -100,
+      "logit_softcap"_a = 0.0f,
+      "stream"_a = nb::none());
+
+  m.def(
       "dense_cce_backward",
       &mlx_cce_runtime_ext::dense_cce_backward,
       "hidden"_a,

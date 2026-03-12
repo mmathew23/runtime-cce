@@ -57,7 +57,10 @@ class TestRuntimeCCE(unittest.TestCase):
 
     def test_dense_forward_matches_reference(self):
         expected = _reference_loss(self.hidden, self.weight, self.targets)
-        for runtime_variant in ("clean", "iter", "simd", "fused_finalize"):
+        variants = ["clean", "iter", "simd", "fused_finalize"]
+        if _native_ext is not None and hasattr(_native_ext, "dense_cce_loss_custom"):
+            variants.append("native_bridge")
+        for runtime_variant in variants:
             with self.subTest(runtime_variant=runtime_variant):
                 runtime_cce, _ = make_chunked_cross_entropy_loss(
                     ignore_index=-100,
@@ -121,6 +124,20 @@ class TestRuntimeCCE(unittest.TestCase):
     def test_invalid_runtime_variant_raises(self):
         with self.assertRaises(ValueError):
             make_chunked_cross_entropy_loss(runtime_variant="unknown")
+
+    def test_native_bridge_forward_runs(self):
+        if _native_ext is None or not hasattr(_native_ext, "dense_cce_loss_custom"):
+            self.skipTest("native bridge extension not built")
+
+        runtime_cce, _ = make_chunked_cross_entropy_loss(
+            ignore_index=-100,
+            chunk_size=2,
+            runtime_variant="native_bridge",
+        )
+        losses = runtime_cce(self.hidden, self.weight, self.targets)
+        expected = _reference_loss(self.hidden, self.weight, self.targets)
+        mx.eval(losses, expected)
+        self.assertTrue(mx.allclose(losses, expected, atol=1e-5, rtol=1e-5).item())
 
     def test_install_is_idempotent(self):
         first = install_mlx_fast_cce_loss(override=True)

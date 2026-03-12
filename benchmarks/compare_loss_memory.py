@@ -109,7 +109,7 @@ def main():
     parser.add_argument("--chunk-size", type=int, default=0)
     parser.add_argument(
         "--runtime-variant",
-        choices=["clean", "fused_finalize", "iter", "simd"],
+        choices=["clean", "fused_finalize", "iter", "simd", "native_bridge"],
         default="clean",
     )
     parser.add_argument("--seed", type=int, default=0)
