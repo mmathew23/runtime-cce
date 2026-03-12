@@ -34,12 +34,20 @@ std::string current_binary_dir() {
 constexpr int MAX_CHUNK_V = 16384;
 constexpr int MIN_CHUNK_V = 1024;
 
-int get_adaptive_chunk_v(int n, int v, int /* h_dim */) {
+struct PreparedArray {
+  mx::array value;
+  bool temporary{false};
+};
+
+int get_adaptive_chunk_v(
+    int n,
+    int v,
+    size_t bytes_per_element,
+    int scratch_arrays = 1) {
   if (n <= 2048) {
     return std::min(MAX_CHUNK_V, v);
   }
 
-  constexpr size_t bytes_per_element = 4;
   size_t system_memory = 64ULL * 1024 * 1024 * 1024;
 #if defined(__APPLE__)
   size_t size = sizeof(system_memory);
@@ -49,8 +57,10 @@ int get_adaptive_chunk_v(int n, int v, int /* h_dim */) {
 #endif
 
   size_t chunk_budget = system_memory / 200;
-  int max_chunk_from_memory =
-      static_cast<int>(chunk_budget / (static_cast<size_t>(n) * bytes_per_element));
+  size_t denom = static_cast<size_t>(std::max(n, 1)) *
+      std::max<size_t>(bytes_per_element, 1) *
+      static_cast<size_t>(std::max(scratch_arrays, 1));
+  int max_chunk_from_memory = static_cast<int>(chunk_budget / denom);
   int chunk_v = std::min({MAX_CHUNK_V, v, std::max(MIN_CHUNK_V, max_chunk_from_memory)});
   chunk_v = (chunk_v / 256) * 256;
   if (chunk_v < MIN_CHUNK_V) {
@@ -71,15 +81,24 @@ bool is_supported_compute_dtype(mx::Dtype dtype) {
   return dtype == mx::float16 || dtype == mx::bfloat16 || dtype == mx::float32;
 }
 
-mx::array materialize(const mx::array& arr, mx::Dtype dtype, mx::Stream s) {
-  mx::array out = (arr.dtype() == dtype) ? arr : mx::astype(arr, dtype, s);
-  if (!out.flags().row_contiguous) {
-    out = mx::contiguous(out, false, s);
+PreparedArray materialize_input(const mx::array& arr, mx::Dtype dtype, mx::Stream s) {
+  PreparedArray prepared{
+      (arr.dtype() == dtype) ? arr : mx::astype(arr, dtype, s),
+      arr.dtype() != dtype};
+  if (!prepared.value.flags().row_contiguous) {
+    prepared.value = mx::contiguous(prepared.value, false, s);
+    prepared.temporary = true;
   }
-  if (out.has_primitive()) {
-    out.eval();
+  if (prepared.value.has_primitive()) {
+    prepared.value.eval();
   }
-  return out;
+  return prepared;
+}
+
+void add_if_temporary(mx::metal::Device& d, const PreparedArray& prepared, const mx::Stream& s) {
+  if (prepared.temporary) {
+    d.add_temporary(prepared.value, s.index);
+  }
 }
 
 void launch_regular_gemm(
@@ -356,7 +375,7 @@ std::pair<mx::array, mx::array> dense_cce_loss_custom(
   auto fun = [ignore_index, logit_softcap, stream](const std::vector<mx::array>& inputs) {
     auto [loss, lse] = dense_cce_loss(
         inputs[0], inputs[1], inputs[2], ignore_index, logit_softcap, stream);
-    return std::vector<mx::array>{mx::copy(loss, stream), mx::copy(lse, stream)};
+    return std::vector<mx::array>{loss, lse};
   };
 
   auto fun_vjp =
@@ -405,7 +424,7 @@ mx::array dense_cce_loss_single_custom(
   auto fun = [ignore_index, logit_softcap, stream](const std::vector<mx::array>& inputs) {
     auto [loss, _] = dense_cce_loss(
         inputs[0], inputs[1], inputs[2], ignore_index, logit_softcap, stream);
-    return std::vector<mx::array>{mx::copy(loss, stream)};
+    return std::vector<mx::array>{loss};
   };
 
   auto fun_vjp =
@@ -502,9 +521,13 @@ void DenseCCELoss::eval_gpu(
   int h_dim = hidden_in.shape(1);
   int vocab = weight_in.shape(0);
 
-  auto hidden = materialize(hidden_in, hidden_in.dtype(), s);
-  auto weight = materialize(weight_in, weight_in.dtype(), s);
-  auto targets = materialize(targets_in, mx::int32, s);
+  auto hidden_prepared = materialize_input(hidden_in, hidden_in.dtype(), s);
+  auto weight_prepared = materialize_input(weight_in, weight_in.dtype(), s);
+  auto targets_prepared = materialize_input(targets_in, mx::int32, s);
+
+  auto& hidden = hidden_prepared.value;
+  auto& weight = weight_prepared.value;
+  auto& targets = targets_prepared.value;
 
   auto& loss = outputs[0];
   loss.set_data(mx::allocator::malloc(loss.nbytes()));
@@ -512,7 +535,7 @@ void DenseCCELoss::eval_gpu(
     outputs[1].set_data(mx::allocator::malloc(outputs[1].nbytes()));
   }
 
-  int adaptive_chunk_v = get_adaptive_chunk_v(n, vocab, h_dim);
+  int adaptive_chunk_v = get_adaptive_chunk_v(n, vocab, hidden.itemsize(), 1);
   int num_chunks = (vocab + adaptive_chunk_v - 1) / adaptive_chunk_v;
   int max_chunk_v = std::min(adaptive_chunk_v, vocab);
 
@@ -628,6 +651,9 @@ void DenseCCELoss::eval_gpu(
   }
   compute_encoder.dispatch_threadgroups(MTL::Size((n + 255) / 256, 1, 1), MTL::Size(256, 1, 1));
 
+  add_if_temporary(d, hidden_prepared, s);
+  add_if_temporary(d, weight_prepared, s);
+  add_if_temporary(d, targets_prepared, s);
   d.add_temporary(logits_chunk, s.index);
   d.add_temporary(running_state, s.index);
 }
@@ -700,13 +726,24 @@ void DenseCCELossVJP::eval_gpu(
   int h_dim = hidden_in.shape(1);
   int vocab = weight_in.shape(0);
 
-  auto hidden = materialize(hidden_in, hidden_in.dtype(), s);
-  auto weight = materialize(weight_in, weight_in.dtype(), s);
-  auto targets = materialize(targets_in, mx::int32, s);
-  auto grad_output_raw = materialize(grad_output_in, mx::float32, s);
-  auto grad_output = grad_output_raw.size() == 1
-      ? materialize(mx::full({n}, 1.0f / static_cast<float>(n), mx::float32, s), mx::float32, s)
-      : grad_output_raw;
+  auto hidden_prepared = materialize_input(hidden_in, hidden_in.dtype(), s);
+  auto weight_prepared = materialize_input(weight_in, weight_in.dtype(), s);
+  auto targets_prepared = materialize_input(targets_in, mx::int32, s);
+  auto grad_output_prepared = materialize_input(grad_output_in, mx::float32, s);
+  std::optional<PreparedArray> grad_output_broadcast_prepared;
+  if (grad_output_prepared.value.size() == 1) {
+    grad_output_broadcast_prepared = materialize_input(
+        mx::broadcast_to(grad_output_prepared.value, {n}, s),
+        mx::float32,
+        s);
+  }
+
+  auto& hidden = hidden_prepared.value;
+  auto& weight = weight_prepared.value;
+  auto& targets = targets_prepared.value;
+  auto& grad_output = grad_output_broadcast_prepared.has_value()
+      ? grad_output_broadcast_prepared->value
+      : grad_output_prepared.value;
 
   size_t output_idx = 0;
   mx::array* grad_hidden = nullptr;
@@ -720,7 +757,11 @@ void DenseCCELossVJP::eval_gpu(
     grad_weight->set_data(mx::allocator::malloc(grad_weight->nbytes()));
   }
 
-  int adaptive_chunk_v = get_adaptive_chunk_v(n, vocab, h_dim);
+  int adaptive_chunk_v = get_adaptive_chunk_v(
+      n,
+      vocab,
+      hidden.itemsize(),
+      (has_logsumexp_ && inputs.size() > 4) ? 2 : 3);
   int num_chunks = (vocab + adaptive_chunk_v - 1) / adaptive_chunk_v;
   int max_chunk_v = std::min(adaptive_chunk_v, vocab);
 
@@ -728,13 +769,14 @@ void DenseCCELossVJP::eval_gpu(
   auto& compute_encoder = d.get_command_encoder(s.index);
 
   mx::array logsumexp({n}, mx::float32, nullptr, {});
-  bool logsumexp_needs_temp = false;
+  bool owns_logsumexp = false;
+  std::optional<PreparedArray> provided_logsumexp;
 
   if (has_logsumexp_ && inputs.size() > 4) {
-    logsumexp = materialize(inputs[4], mx::float32, s);
-    logsumexp_needs_temp = false;
+    provided_logsumexp = materialize_input(inputs[4], mx::float32, s);
+    logsumexp = provided_logsumexp->value;
   } else {
-    logsumexp_needs_temp = true;
+    owns_logsumexp = true;
     logsumexp.set_data(mx::allocator::malloc(logsumexp.nbytes()));
 
     mx::array running_state({2 * n}, mx::float32, nullptr, {});
@@ -967,7 +1009,16 @@ void DenseCCELossVJP::eval_gpu(
     }
   }
 
-  if (logsumexp_needs_temp) {
+  add_if_temporary(d, hidden_prepared, s);
+  add_if_temporary(d, weight_prepared, s);
+  add_if_temporary(d, targets_prepared, s);
+  add_if_temporary(d, grad_output_prepared, s);
+  if (grad_output_broadcast_prepared.has_value()) {
+    add_if_temporary(d, *grad_output_broadcast_prepared, s);
+  }
+  if (provided_logsumexp.has_value()) {
+    add_if_temporary(d, *provided_logsumexp, s);
+  } else if (owns_logsumexp) {
     d.add_temporary(logsumexp, s.index);
   }
   d.add_temporary(logits_chunk, s.index);

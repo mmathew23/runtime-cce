@@ -30,6 +30,23 @@ def _native_runtime_enabled() -> bool:
     return os.environ.get("MLX_CCE_RUNTIME_USE_NATIVE", "0") == "1"
 
 
+def _native_dense_runtime_available(*, quantized: bool) -> bool:
+    return (
+        not quantized
+        and _native_ext is not None
+        and mx.metal.is_available()
+        and hasattr(_native_ext, "dense_cce_loss")
+        and hasattr(_native_ext, "dense_cce_backward")
+    )
+
+
+def _primary_cotangent(cotangents, reference: mx.array) -> mx.array:
+    cotangent = cotangents[0] if isinstance(cotangents, tuple) else cotangents
+    if cotangent is None:
+        return mx.zeros_like(reference)
+    return cotangent
+
+
 def _normalize_runtime_variant(runtime_variant: str) -> str:
     try:
         return _RUNTIME_VARIANT_ALIASES[runtime_variant]
@@ -853,6 +870,55 @@ def make_runtime_cce_loss_fused_finalize(
     bits: int | None = None,
     mode: str = "affine",
 ):
+    if runtime_variant == "native_bridge":
+        if not _native_dense_runtime_available(quantized=quantized):
+            raise RuntimeError("runtime_variant='native_bridge' requires the native dense extension on Metal.")
+
+        @mx.custom_function
+        def runtime_cce_loss_full(hidden: mx.array, weight: mx.array, targets: mx.array):
+            losses, _ = _native_ext.dense_cce_loss(
+                hidden,
+                weight,
+                targets.astype(mx.int32),
+                ignore_index=ignore_index,
+                logit_softcap=logit_softcap,
+            )
+            return losses
+
+        @runtime_cce_loss_full.vjp
+        def runtime_cce_loss_vjp(primals, cotangents, outputs):
+            hidden, weight, targets = primals
+            grad_output = _primary_cotangent(cotangents, outputs).astype(mx.float32)
+            _, lse = _native_ext.dense_cce_loss(
+                hidden,
+                weight,
+                targets.astype(mx.int32),
+                ignore_index=ignore_index,
+                logit_softcap=logit_softcap,
+            )
+            mx.eval(grad_output, lse)
+
+            grad_hidden, grad_weight = _native_ext.dense_cce_backward(
+                hidden,
+                weight,
+                targets.astype(mx.int32),
+                grad_output,
+                lse,
+                ignore_index=ignore_index,
+                logit_softcap=logit_softcap,
+            )
+
+            return (
+                grad_hidden.astype(hidden.dtype),
+                grad_weight.astype(weight.dtype),
+                mx.zeros_like(targets),
+            )
+
+        def runtime_cce_loss(hidden: mx.array, weight: mx.array, targets: mx.array) -> mx.array:
+            return runtime_cce_loss_full(hidden, weight, targets)
+
+        return runtime_cce_loss, True
+
     forward_update_kernel, forward_update_finalize_kernel, dlogits_kernel, runtime_variant = _build_kernel_set(
         runtime_variant
     )
@@ -1045,16 +1111,6 @@ def make_runtime_cce_loss_fused_finalize(
             grad_output = mx.zeros_like(outputs[0])
         grad_output32 = grad_output.astype(mx.float32)
         lse = outputs[1].astype(mx.float32)
-
-        if runtime_variant == "native_bridge" and _native_ext is not None and mx.metal.is_available():
-            losses, _ = _native_ext.dense_cce_loss_custom(
-                hidden,
-                weight,
-                targets.astype(mx.int32),
-                ignore_index=ignore_index,
-                logit_softcap=logit_softcap,
-            )
-            return losses
 
         if _native_ext is not None and _native_runtime_enabled() and mx.metal.is_available():
             grad_hidden, grad_weight = _native_ext.dense_cce_backward(
