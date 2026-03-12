@@ -17,9 +17,24 @@ __all__ = [
     "make_runtime_cce_loss_fused_finalize",
 ]
 
+_RUNTIME_VARIANT_ALIASES = {
+    "clean": "clean",
+    "fused_finalize": "clean",
+    "iter": "iter",
+    "simd": "simd",
+}
+
 
 def _native_runtime_enabled() -> bool:
     return os.environ.get("MLX_CCE_RUNTIME_USE_NATIVE", "0") == "1"
+
+
+def _normalize_runtime_variant(runtime_variant: str) -> str:
+    try:
+        return _RUNTIME_VARIANT_ALIASES[runtime_variant]
+    except KeyError as exc:
+        valid = ", ".join(sorted(_RUNTIME_VARIANT_ALIASES))
+        raise ValueError(f"Unsupported runtime_variant {runtime_variant!r}. Expected one of: {valid}.") from exc
 
 
 def _resolve_chunk_size(
@@ -185,6 +200,141 @@ def _build_forward_update_kernel() -> Callable:
     )
 
 
+def _build_forward_update_kernel_simd() -> Callable:
+    source = """
+        uint gid = thread_position_in_grid.x;
+        uint row = gid / 256;
+        uint n = logits_shape[0];
+        if (row >= n) {
+            return;
+        }
+
+        uint lid = gid % 256;
+        uint simd_lid = thread_index_in_simdgroup;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint tpg = 256;
+        const uint NUM_SIMDGROUPS = 8;
+        uint chunk_v = logits_shape[1];
+        int base = int(row * chunk_v);
+        int target = targets[row];
+        int v_start = v_start_arr[0];
+        int ignore_index = ignore_index_arr[0];
+        float softcap = softcap_arr[0];
+
+        threadgroup float max_sg[NUM_SIMDGROUPS];
+        threadgroup float sum_sg[NUM_SIMDGROUPS];
+        threadgroup float target_sg[NUM_SIMDGROUPS];
+        threadgroup uint found_sg[NUM_SIMDGROUPS];
+
+        float local_max = -INFINITY;
+        for (uint col = lid; col < chunk_v; col += tpg) {
+            float raw = logits[base + int(col)];
+            float val = raw;
+            if (softcap > 0.0f) {
+                val = softcap * fast::tanh(raw / softcap);
+            }
+            local_max = metal::max(local_max, val);
+        }
+
+        float sg_max = simd_max(local_max);
+        if (simd_lid == 0) {
+            max_sg[simd_gid] = sg_max;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_gid == 0) {
+            float lane_val = (simd_lid < NUM_SIMDGROUPS) ? max_sg[simd_lid] : -INFINITY;
+            float tg_max = simd_max(lane_val);
+            if (simd_lid == 0) {
+                max_sg[0] = tg_max;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float chunk_max = max_sg[0];
+
+        float local_sum = 0.0f;
+        float local_target = 0.0f;
+        uint found_target = 0;
+        for (uint col = lid; col < chunk_v; col += tpg) {
+            float raw = logits[base + int(col)];
+            float val = raw;
+            if (softcap > 0.0f) {
+                val = softcap * fast::tanh(raw / softcap);
+            }
+            local_sum += fast::exp(val - chunk_max);
+            int global_v = v_start + int(col);
+            if (global_v == target) {
+                local_target = val;
+                found_target = 1;
+            }
+        }
+
+        float sg_sum = simd_sum(local_sum);
+        float sg_target = simd_sum(local_target);
+        bool sg_found_b = simd_any(found_target != 0);
+        if (simd_lid == 0) {
+            sum_sg[simd_gid] = sg_sum;
+            target_sg[simd_gid] = sg_target;
+            found_sg[simd_gid] = sg_found_b ? 1 : 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_gid == 0) {
+            float lane_val = (simd_lid < NUM_SIMDGROUPS) ? sum_sg[simd_lid] : 0.0f;
+            float tg_sum = simd_sum(lane_val);
+            if (simd_lid == 0) {
+                sum_sg[0] = tg_sum;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float chunk_sum = sum_sg[0];
+
+        if (lid == 0) {
+            float old_max = running_max_in[row];
+            float old_sum = running_sum_in[row];
+            float new_max = metal::max(old_max, chunk_max);
+            float new_sum = old_sum * fast::exp(old_max - new_max) +
+                            chunk_sum * fast::exp(chunk_max - new_max);
+
+            running_max_out[row] = new_max;
+            running_sum_out[row] = new_sum;
+
+            uint found_any = 0;
+            float target_val = target_in[row];
+            for (uint i = 0; i < NUM_SIMDGROUPS; ++i) {
+                if (found_sg[i] != 0) {
+                    found_any = 1;
+                    target_val = target_sg[i];
+                    break;
+                }
+            }
+
+            if (target != ignore_index && found_any != 0) {
+                target_out[row] = target_val;
+            } else {
+                target_out[row] = target_in[row];
+            }
+        }
+    """
+
+    return mx.fast.metal_kernel(
+        name="cce_runtime_forward_update_simd",
+        input_names=[
+            "logits",
+            "targets",
+            "running_max_in",
+            "running_sum_in",
+            "target_in",
+            "v_start_arr",
+            "ignore_index_arr",
+            "softcap_arr",
+        ],
+        output_names=["running_max_out", "running_sum_out", "target_out"],
+        source=source,
+        ensure_row_contiguous=True,
+    )
+
+
 def _build_forward_update_finalize_kernel() -> Callable:
     source = """
         uint gid = thread_position_in_grid.x;
@@ -303,6 +453,147 @@ def _build_forward_update_finalize_kernel() -> Callable:
     )
 
 
+def _build_forward_update_finalize_kernel_simd() -> Callable:
+    source = """
+        uint gid = thread_position_in_grid.x;
+        uint row = gid / 256;
+        uint n = logits_shape[0];
+        if (row >= n) {
+            return;
+        }
+
+        uint lid = gid % 256;
+        uint simd_lid = thread_index_in_simdgroup;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint tpg = 256;
+        const uint NUM_SIMDGROUPS = 8;
+        uint chunk_v = logits_shape[1];
+        int base = int(row * chunk_v);
+        int target = targets[row];
+        int v_start = v_start_arr[0];
+        int ignore_index = ignore_index_arr[0];
+        float softcap = softcap_arr[0];
+
+        threadgroup float max_sg[NUM_SIMDGROUPS];
+        threadgroup float sum_sg[NUM_SIMDGROUPS];
+        threadgroup float target_sg[NUM_SIMDGROUPS];
+        threadgroup uint found_sg[NUM_SIMDGROUPS];
+
+        float local_max = -INFINITY;
+        for (uint col = lid; col < chunk_v; col += tpg) {
+            float raw = logits[base + int(col)];
+            float val = raw;
+            if (softcap > 0.0f) {
+                val = softcap * fast::tanh(raw / softcap);
+            }
+            local_max = metal::max(local_max, val);
+        }
+
+        float sg_max = simd_max(local_max);
+        if (simd_lid == 0) {
+            max_sg[simd_gid] = sg_max;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_gid == 0) {
+            float lane_val = (simd_lid < NUM_SIMDGROUPS) ? max_sg[simd_lid] : -INFINITY;
+            float tg_max = simd_max(lane_val);
+            if (simd_lid == 0) {
+                max_sg[0] = tg_max;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float chunk_max = max_sg[0];
+
+        float local_sum = 0.0f;
+        float local_target = 0.0f;
+        uint found_target = 0;
+        for (uint col = lid; col < chunk_v; col += tpg) {
+            float raw = logits[base + int(col)];
+            float val = raw;
+            if (softcap > 0.0f) {
+                val = softcap * fast::tanh(raw / softcap);
+            }
+            local_sum += fast::exp(val - chunk_max);
+            int global_v = v_start + int(col);
+            if (global_v == target) {
+                local_target = val;
+                found_target = 1;
+            }
+        }
+
+        float sg_sum = simd_sum(local_sum);
+        float sg_target = simd_sum(local_target);
+        bool sg_found_b = simd_any(found_target != 0);
+        if (simd_lid == 0) {
+            sum_sg[simd_gid] = sg_sum;
+            target_sg[simd_gid] = sg_target;
+            found_sg[simd_gid] = sg_found_b ? 1 : 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_gid == 0) {
+            float lane_val = (simd_lid < NUM_SIMDGROUPS) ? sum_sg[simd_lid] : 0.0f;
+            float tg_sum = simd_sum(lane_val);
+            if (simd_lid == 0) {
+                sum_sg[0] = tg_sum;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float chunk_sum = sum_sg[0];
+
+        if (lid == 0) {
+            float old_max = running_max_in[row];
+            float old_sum = running_sum_in[row];
+            float new_max = metal::max(old_max, chunk_max);
+            float new_sum = old_sum * fast::exp(old_max - new_max) +
+                            chunk_sum * fast::exp(chunk_max - new_max);
+            float new_target = target_in[row];
+            uint found_any = 0;
+            float target_val = target_in[row];
+            for (uint i = 0; i < NUM_SIMDGROUPS; ++i) {
+                if (found_sg[i] != 0) {
+                    found_any = 1;
+                    target_val = target_sg[i];
+                    break;
+                }
+            }
+            if (target != ignore_index && found_any != 0) {
+                new_target = target_val;
+            }
+
+            running_max_out[row] = new_max;
+            running_sum_out[row] = new_sum;
+            target_out[row] = new_target;
+
+            float lse = new_max + fast::log(metal::max(new_sum, 1e-9f));
+            lse_out[row] = lse;
+            if (target == ignore_index) {
+                loss_out[row] = 0.0f;
+            } else {
+                loss_out[row] = lse - new_target;
+            }
+        }
+    """
+
+    return mx.fast.metal_kernel(
+        name="cce_runtime_forward_update_finalize_simd",
+        input_names=[
+            "logits",
+            "targets",
+            "running_max_in",
+            "running_sum_in",
+            "target_in",
+            "v_start_arr",
+            "ignore_index_arr",
+            "softcap_arr",
+        ],
+        output_names=["running_max_out", "running_sum_out", "target_out", "loss_out", "lse_out"],
+        source=source,
+        ensure_row_contiguous=True,
+    )
+
+
 def _build_dlogits_kernel() -> Callable:
     source = """
         uint tid = thread_position_in_grid.x;
@@ -363,6 +654,28 @@ def _build_dlogits_kernel() -> Callable:
         output_names=["d_logits"],
         source=source,
         ensure_row_contiguous=True,
+    )
+
+
+def _build_kernel_set(runtime_variant: str) -> tuple[Callable | None, Callable | None, Callable | None, str]:
+    runtime_variant = _normalize_runtime_variant(runtime_variant)
+    use_metal_kernel = bool(mx.metal.is_available())
+    if not use_metal_kernel:
+        return None, None, None, runtime_variant
+
+    if runtime_variant == "simd":
+        return (
+            _build_forward_update_kernel_simd(),
+            _build_forward_update_finalize_kernel_simd(),
+            _build_dlogits_kernel(),
+            runtime_variant,
+        )
+
+    return (
+        _build_forward_update_kernel(),
+        _build_forward_update_finalize_kernel(),
+        _build_dlogits_kernel(),
+        runtime_variant,
     )
 
 
@@ -530,15 +843,16 @@ def make_runtime_cce_loss_fused_finalize(
     ignore_index: int,
     logit_softcap: float,
     chunk_size: int,
+    runtime_variant: str = "clean",
     quantized: bool = False,
     group_size: int | None = None,
     bits: int | None = None,
     mode: str = "affine",
 ):
-    use_metal_kernel = bool(mx.metal.is_available())
-    forward_update_kernel = _build_forward_update_kernel() if use_metal_kernel else None
-    forward_update_finalize_kernel = _build_forward_update_finalize_kernel() if use_metal_kernel else None
-    dlogits_kernel = _build_dlogits_kernel() if use_metal_kernel else None
+    forward_update_kernel, forward_update_finalize_kernel, dlogits_kernel, runtime_variant = _build_kernel_set(
+        runtime_variant
+    )
+    use_metal_kernel = dlogits_kernel is not None
 
     ignore_arr = mx.array([ignore_index], dtype=mx.int32)
     softcap_arr = mx.array([logit_softcap], dtype=mx.float32)
@@ -633,7 +947,11 @@ def make_runtime_cce_loss_fused_finalize(
 
                 if dlogits_kernel is not None:
                     total_threads = (logits.size + n_reads - 1) // n_reads
-                    dlogits_out_dtype = mx.float32 if logits.dtype == mx.bfloat16 else logits.dtype
+                    dlogits_out_dtype = (
+                        mx.float16
+                        if runtime_variant in {"iter", "simd"} and logits.dtype == mx.bfloat16
+                        else (mx.float32 if logits.dtype == mx.bfloat16 else logits.dtype)
+                    )
                     d_logits = dlogits_kernel(
                         inputs=[
                             logits,
@@ -758,7 +1076,11 @@ def make_runtime_cce_loss_fused_finalize(
 
             if dlogits_kernel is not None:
                 total_threads = (logits.size + n_reads - 1) // n_reads
-                dlogits_out_dtype = mx.float32 if logits.dtype == mx.bfloat16 else logits.dtype
+                dlogits_out_dtype = (
+                    mx.float16
+                    if runtime_variant in {"iter", "simd"} and logits.dtype == mx.bfloat16
+                    else (mx.float32 if logits.dtype == mx.bfloat16 else logits.dtype)
+                )
                 d_logits = dlogits_kernel(
                     inputs=[
                         logits,
@@ -809,6 +1131,7 @@ def make_chunked_cross_entropy_loss(
     ignore_index: int = -100,
     logit_softcap: float = 0.0,
     chunk_size: int = 0,
+    runtime_variant: str = "clean",
     quantized: bool = False,
     group_size: int | None = None,
     bits: int | None = None,
@@ -820,6 +1143,7 @@ def make_chunked_cross_entropy_loss(
         ignore_index=ignore_index,
         logit_softcap=logit_softcap,
         chunk_size=chunk_size,
+        runtime_variant=runtime_variant,
         quantized=quantized,
         group_size=group_size,
         bits=bits,

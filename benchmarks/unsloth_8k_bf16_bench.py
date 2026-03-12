@@ -1,4 +1,5 @@
 import json
+import os
 import time
 
 import mlx
@@ -13,6 +14,7 @@ MODEL_NAME = "mlx-community/Llama-3.2-1B-Instruct-bf16"
 SEQ_LEN = 8192
 BATCH_SIZE = 1
 N_STEPS = 1
+RUNTIME_VARIANT = os.environ.get("MLX_CCE_RUNTIME_VARIANT", "clean")
 
 
 def make_dataset():
@@ -95,6 +97,7 @@ def main():
         "model": MODEL_NAME,
         "seq_len": SEQ_LEN,
         "batch_size": BATCH_SIZE,
+        "runtime_variant": RUNTIME_VARIANT,
         "mlx_path": list(getattr(mlx, "__path__", [])),
         "core_file": mx.__file__,
         "has_cce_kernel_before": hasattr(mx.fast, "cce_loss"),

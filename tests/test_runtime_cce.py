@@ -56,11 +56,17 @@ class TestRuntimeCCE(unittest.TestCase):
         self.targets = mx.array([1, 3, -100], dtype=mx.int32)
 
     def test_dense_forward_matches_reference(self):
-        runtime_cce, _ = make_chunked_cross_entropy_loss(ignore_index=-100, chunk_size=2)
-        actual = runtime_cce(self.hidden, self.weight, self.targets)
         expected = _reference_loss(self.hidden, self.weight, self.targets)
-        mx.eval(actual, expected)
-        self.assertTrue(mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item())
+        for runtime_variant in ("clean", "iter", "simd", "fused_finalize"):
+            with self.subTest(runtime_variant=runtime_variant):
+                runtime_cce, _ = make_chunked_cross_entropy_loss(
+                    ignore_index=-100,
+                    chunk_size=2,
+                    runtime_variant=runtime_variant,
+                )
+                actual = runtime_cce(self.hidden, self.weight, self.targets)
+                mx.eval(actual, expected)
+                self.assertTrue(mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item())
 
     def test_dense_gradients_match_reference(self):
         if _native_ext is None:
@@ -85,28 +91,36 @@ class TestRuntimeCCE(unittest.TestCase):
         self.assertTrue(mx.allclose(runtime_weight_grad, ref_weight_grad, atol=1e-5, rtol=1e-5).item())
 
     def test_quantized_path_runs_and_produces_hidden_grad(self):
-        runtime_cce, _ = make_chunked_cross_entropy_loss(
-            ignore_index=-100,
-            chunk_size=2,
-            quantized=True,
-            group_size=32,
-            bits=4,
-        )
         weight = mx.arange(64 * 32, dtype=mx.float32).reshape(64, 32) / 100.0
         hidden = mx.arange(3 * 32, dtype=mx.float32).reshape(3, 32) / 50.0
         targets = mx.array([1, 7, -100], dtype=mx.int32)
         q_weight, scales, biases = mx.quantize(weight, group_size=32, bits=4)
 
-        def total(hidden_input):
-            return runtime_cce(hidden_input, q_weight, scales, biases, targets).sum()
+        for runtime_variant in ("clean", "iter", "simd"):
+            with self.subTest(runtime_variant=runtime_variant):
+                runtime_cce, _ = make_chunked_cross_entropy_loss(
+                    ignore_index=-100,
+                    chunk_size=2,
+                    runtime_variant=runtime_variant,
+                    quantized=True,
+                    group_size=32,
+                    bits=4,
+                )
 
-        grad_fn = mx.grad(total)
-        hidden_grad = grad_fn(hidden)
-        losses = runtime_cce(hidden, q_weight, scales, biases, targets)
-        mx.eval(losses, hidden_grad)
+                def total(hidden_input):
+                    return runtime_cce(hidden_input, q_weight, scales, biases, targets).sum()
 
-        self.assertEqual(losses.shape, targets.shape)
-        self.assertGreater(float(mx.abs(hidden_grad).max()), 0.0)
+                grad_fn = mx.grad(total)
+                hidden_grad = grad_fn(hidden)
+                losses = runtime_cce(hidden, q_weight, scales, biases, targets)
+                mx.eval(losses, hidden_grad)
+
+                self.assertEqual(losses.shape, targets.shape)
+                self.assertGreater(float(mx.abs(hidden_grad).max()), 0.0)
+
+    def test_invalid_runtime_variant_raises(self):
+        with self.assertRaises(ValueError):
+            make_chunked_cross_entropy_loss(runtime_variant="unknown")
 
     def test_install_is_idempotent(self):
         first = install_mlx_fast_cce_loss(override=True)

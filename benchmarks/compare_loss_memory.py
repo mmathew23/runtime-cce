@@ -55,7 +55,7 @@ def estimate_baseline_dense(args):
     }
 
 
-def make_loss(impl, chunk_size):
+def make_loss(impl, chunk_size, runtime_variant):
     if impl == "baseline":
         def loss_fn(hidden, weight, targets):
             logits = hidden @ weight.T
@@ -71,6 +71,7 @@ def make_loss(impl, chunk_size):
             ignore_index=-100,
             logit_softcap=0.0,
             chunk_size=chunk_size,
+            runtime_variant=runtime_variant,
         )
 
         def loss_fn(hidden, weight, targets):
@@ -106,6 +107,11 @@ def main():
     parser.add_argument("--hidden-size", type=int, default=2048)
     parser.add_argument("--vocab-size", type=int, default=128256)
     parser.add_argument("--chunk-size", type=int, default=0)
+    parser.add_argument(
+        "--runtime-variant",
+        choices=["clean", "fused_finalize", "iter", "simd"],
+        default="clean",
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -130,6 +136,7 @@ def main():
         "hidden_size": args.hidden_size,
         "vocab_size": args.vocab_size,
         "dtype": "bfloat16",
+        "runtime_variant": args.runtime_variant,
         "snapshots": [snapshot("inputs_eval")],
     }
 
@@ -138,7 +145,7 @@ def main():
     if args.impl == "baseline":
         result["baseline_estimate"] = estimate_baseline_dense(args)
 
-    loss_fn = make_loss(args.impl, args.chunk_size)
+    loss_fn = make_loss(args.impl, args.chunk_size, args.runtime_variant)
     loss = loss_fn(hidden, weight, targets)
     mx.eval(loss)
     result["loss"] = float(loss.item())
