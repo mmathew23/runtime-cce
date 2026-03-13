@@ -15,14 +15,43 @@ except ImportError:
 __all__ = [
     "make_chunked_cross_entropy_loss",
     "make_runtime_cce_loss_fused_finalize",
+    "RUNTIME_VARIANT_INFO",
+    "SUPPORTED_RUNTIME_VARIANTS",
+    "LEGACY_RUNTIME_VARIANT_ALIASES",
 ]
 
+RUNTIME_VARIANT_INFO = {
+    "balanced": (
+        "Default runtime path. Uses the stable chunked forward/backward composition "
+        "with full-precision dlogits accumulation."
+    ),
+    "compact_backward": (
+        "Experimental runtime path that stores bf16 backward chunks more compactly "
+        "to reduce the isolated loss-step peak."
+    ),
+    "simd_reduction": (
+        "Experimental runtime path that keeps compact backward chunks and swaps in "
+        "SIMD-group forward reduction kernels."
+    ),
+}
+
+SUPPORTED_RUNTIME_VARIANTS = tuple(RUNTIME_VARIANT_INFO)
+
+LEGACY_RUNTIME_VARIANT_ALIASES = {
+    "clean": "balanced",
+    "fused_finalize": "balanced",
+    "iter": "compact_backward",
+    "simd": "simd_reduction",
+}
+
 _RUNTIME_VARIANT_ALIASES = {
-    "clean": "clean",
-    "fused_finalize": "clean",
-    "iter": "iter",
-    "simd": "simd",
+    "balanced": "balanced",
+    "compact_backward": "compact_backward",
+    "simd_reduction": "simd_reduction",
+    **LEGACY_RUNTIME_VARIANT_ALIASES,
+    "native": "native",
     "native_bridge": "native_bridge",
+    "native_custom_vjp": "native_custom_vjp",
 }
 
 
@@ -36,7 +65,24 @@ def _native_dense_runtime_available(*, quantized: bool) -> bool:
         and _native_ext is not None
         and mx.metal.is_available()
         and hasattr(_native_ext, "dense_cce_loss")
-        and hasattr(_native_ext, "dense_cce_backward")
+    )
+
+
+def _native_dense_bridge_available(*, quantized: bool) -> bool:
+    return (
+        not quantized
+        and _native_ext is not None
+        and mx.metal.is_available()
+        and hasattr(_native_ext, "dense_cce_loss_single_custom")
+    )
+
+
+def _native_dense_custom_vjp_available(*, quantized: bool) -> bool:
+    return (
+        not quantized
+        and _native_ext is not None
+        and mx.metal.is_available()
+        and hasattr(_native_ext, "dense_cce_loss_custom")
     )
 
 
@@ -681,7 +727,7 @@ def _build_kernel_set(runtime_variant: str) -> tuple[Callable | None, Callable |
     if not use_metal_kernel:
         return None, None, None, runtime_variant
 
-    if runtime_variant == "simd":
+    if runtime_variant == "simd_reduction":
         return (
             _build_forward_update_kernel_simd(),
             _build_forward_update_finalize_kernel_simd(),
@@ -870,12 +916,11 @@ def make_runtime_cce_loss_fused_finalize(
     bits: int | None = None,
     mode: str = "affine",
 ):
-    if runtime_variant == "native_bridge":
+    if runtime_variant == "native":
         if not _native_dense_runtime_available(quantized=quantized):
-            raise RuntimeError("runtime_variant='native_bridge' requires the native dense extension on Metal.")
+            raise RuntimeError("runtime_variant='native' requires the native dense extension on Metal.")
 
-        @mx.custom_function
-        def runtime_cce_loss_full(hidden: mx.array, weight: mx.array, targets: mx.array):
+        def runtime_cce_loss(hidden: mx.array, weight: mx.array, targets: mx.array) -> mx.array:
             losses, _ = _native_ext.dense_cce_loss(
                 hidden,
                 weight,
@@ -885,37 +930,36 @@ def make_runtime_cce_loss_fused_finalize(
             )
             return losses
 
-        @runtime_cce_loss_full.vjp
-        def runtime_cce_loss_vjp(primals, cotangents, outputs):
-            hidden, weight, targets = primals
-            grad_output = _primary_cotangent(cotangents, outputs).astype(mx.float32)
-            _, lse = _native_ext.dense_cce_loss(
-                hidden,
-                weight,
-                targets.astype(mx.int32),
-                ignore_index=ignore_index,
-                logit_softcap=logit_softcap,
-            )
-            mx.eval(grad_output, lse)
+        return runtime_cce_loss, True
 
-            grad_hidden, grad_weight = _native_ext.dense_cce_backward(
-                hidden,
-                weight,
-                targets.astype(mx.int32),
-                grad_output,
-                lse,
-                ignore_index=ignore_index,
-                logit_softcap=logit_softcap,
-            )
-
-            return (
-                grad_hidden.astype(hidden.dtype),
-                grad_weight.astype(weight.dtype),
-                mx.zeros_like(targets),
-            )
+    if runtime_variant == "native_custom_vjp":
+        if not _native_dense_custom_vjp_available(quantized=quantized):
+            raise RuntimeError("runtime_variant='native_custom_vjp' requires the native dense extension on Metal.")
 
         def runtime_cce_loss(hidden: mx.array, weight: mx.array, targets: mx.array) -> mx.array:
-            return runtime_cce_loss_full(hidden, weight, targets)
+            losses, _ = _native_ext.dense_cce_loss_custom(
+                hidden,
+                weight,
+                targets.astype(mx.int32),
+                ignore_index=ignore_index,
+                logit_softcap=logit_softcap,
+            )
+            return losses
+
+        return runtime_cce_loss, True
+
+    if runtime_variant == "native_bridge":
+        if not _native_dense_bridge_available(quantized=quantized):
+            raise RuntimeError("runtime_variant='native_bridge' requires the native dense extension on Metal.")
+
+        def runtime_cce_loss(hidden: mx.array, weight: mx.array, targets: mx.array) -> mx.array:
+            return _native_ext.dense_cce_loss_single_custom(
+                hidden,
+                weight,
+                targets.astype(mx.int32),
+                ignore_index=ignore_index,
+                logit_softcap=logit_softcap,
+            )
 
         return runtime_cce_loss, True
 
@@ -1019,7 +1063,7 @@ def make_runtime_cce_loss_fused_finalize(
                     total_threads = (logits.size + n_reads - 1) // n_reads
                     dlogits_out_dtype = (
                         mx.float16
-                        if runtime_variant in {"iter", "simd"} and logits.dtype == mx.bfloat16
+                        if runtime_variant in {"compact_backward", "simd_reduction"} and logits.dtype == mx.bfloat16
                         else (mx.float32 if logits.dtype == mx.bfloat16 else logits.dtype)
                     )
                     d_logits = dlogits_kernel(
@@ -1148,7 +1192,7 @@ def make_runtime_cce_loss_fused_finalize(
                 total_threads = (logits.size + n_reads - 1) // n_reads
                 dlogits_out_dtype = (
                     mx.float16
-                    if runtime_variant in {"iter", "simd"} and logits.dtype == mx.bfloat16
+                    if runtime_variant in {"compact_backward", "simd_reduction"} and logits.dtype == mx.bfloat16
                     else (mx.float32 if logits.dtype == mx.bfloat16 else logits.dtype)
                 )
                 d_logits = dlogits_kernel(
@@ -1201,7 +1245,7 @@ def make_chunked_cross_entropy_loss(
     ignore_index: int = -100,
     logit_softcap: float = 0.0,
     chunk_size: int = 0,
-    runtime_variant: str = "clean",
+    runtime_variant: str = "balanced",
     quantized: bool = False,
     group_size: int | None = None,
     bits: int | None = None,

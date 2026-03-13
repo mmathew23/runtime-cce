@@ -3,6 +3,9 @@ import unittest
 import mlx.core as mx
 
 from mlx_cce_runtime import (
+    LEGACY_RUNTIME_VARIANT_ALIASES,
+    RUNTIME_VARIANT_INFO,
+    SUPPORTED_RUNTIME_VARIANTS,
     install_mlx_fast_cce_loss,
     make_chunked_cross_entropy_loss,
 )
@@ -57,9 +60,11 @@ class TestRuntimeCCE(unittest.TestCase):
 
     def test_dense_forward_matches_reference(self):
         expected = _reference_loss(self.hidden, self.weight, self.targets)
-        variants = ["clean", "iter", "simd", "fused_finalize"]
+        variants = list(SUPPORTED_RUNTIME_VARIANTS) + ["clean", "iter", "simd", "fused_finalize"]
+        if _native_ext is not None and hasattr(_native_ext, "dense_cce_loss"):
+            variants.append("native")
         if _native_ext is not None and hasattr(_native_ext, "dense_cce_loss_custom"):
-            variants.append("native_bridge")
+            variants.extend(["native_custom_vjp", "native_bridge"])
         for runtime_variant in variants:
             with self.subTest(runtime_variant=runtime_variant):
                 runtime_cce, _ = make_chunked_cross_entropy_loss(
@@ -70,6 +75,17 @@ class TestRuntimeCCE(unittest.TestCase):
                 actual = runtime_cce(self.hidden, self.weight, self.targets)
                 mx.eval(actual, expected)
                 self.assertTrue(mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item())
+
+    def test_supported_variant_catalog(self):
+        self.assertEqual(
+            SUPPORTED_RUNTIME_VARIANTS,
+            ("balanced", "compact_backward", "simd_reduction"),
+        )
+        self.assertEqual(LEGACY_RUNTIME_VARIANT_ALIASES["clean"], "balanced")
+        self.assertEqual(LEGACY_RUNTIME_VARIANT_ALIASES["iter"], "compact_backward")
+        self.assertEqual(LEGACY_RUNTIME_VARIANT_ALIASES["simd"], "simd_reduction")
+        for variant in SUPPORTED_RUNTIME_VARIANTS:
+            self.assertIn(variant, RUNTIME_VARIANT_INFO)
 
     def test_dense_gradients_match_reference(self):
         if _native_ext is None:
@@ -99,7 +115,7 @@ class TestRuntimeCCE(unittest.TestCase):
         targets = mx.array([1, 7, -100], dtype=mx.int32)
         q_weight, scales, biases = mx.quantize(weight, group_size=32, bits=4)
 
-        for runtime_variant in ("clean", "iter", "simd"):
+        for runtime_variant in ("balanced", "compact_backward", "simd_reduction", "clean", "iter", "simd"):
             with self.subTest(runtime_variant=runtime_variant):
                 runtime_cce, _ = make_chunked_cross_entropy_loss(
                     ignore_index=-100,
@@ -125,19 +141,38 @@ class TestRuntimeCCE(unittest.TestCase):
         with self.assertRaises(ValueError):
             make_chunked_cross_entropy_loss(runtime_variant="unknown")
 
-    def test_native_bridge_forward_runs(self):
-        if _native_ext is None or not hasattr(_native_ext, "dense_cce_loss_custom"):
-            self.skipTest("native bridge extension not built")
+    def test_native_gradients_match_clean_reference(self):
+        if _native_ext is None or not hasattr(_native_ext, "dense_cce_loss"):
+            self.skipTest("native primitive extension not built")
 
-        runtime_cce, _ = make_chunked_cross_entropy_loss(
+        native_cce, _ = make_chunked_cross_entropy_loss(
             ignore_index=-100,
             chunk_size=2,
-            runtime_variant="native_bridge",
+            runtime_variant="native",
         )
-        losses = runtime_cce(self.hidden, self.weight, self.targets)
-        expected = _reference_loss(self.hidden, self.weight, self.targets)
-        mx.eval(losses, expected)
-        self.assertTrue(mx.allclose(losses, expected, atol=1e-5, rtol=1e-5).item())
+
+        clean_cce, _ = make_chunked_cross_entropy_loss(
+            ignore_index=-100,
+            chunk_size=2,
+            runtime_variant="clean",
+        )
+
+        def scalar_native(hidden, weight):
+            return mx.sum(native_cce(hidden, weight, self.targets).astype(mx.float32))
+
+        def scalar_clean(hidden, weight):
+            return mx.sum(clean_cce(hidden, weight, self.targets).astype(mx.float32))
+
+        native_hidden_grad, native_weight_grad = mx.grad(scalar_native, argnums=(0, 1))(self.hidden, self.weight)
+        clean_hidden_grad, clean_weight_grad = mx.grad(scalar_clean, argnums=(0, 1))(self.hidden, self.weight)
+        mx.eval(native_hidden_grad, native_weight_grad, clean_hidden_grad, clean_weight_grad)
+
+        self.assertTrue(
+            mx.allclose(native_hidden_grad, clean_hidden_grad, atol=1e-5, rtol=1e-5).item()
+        )
+        self.assertTrue(
+            mx.allclose(native_weight_grad, clean_weight_grad, atol=1e-5, rtol=1e-5).item()
+        )
 
     def test_install_is_idempotent(self):
         first = install_mlx_fast_cce_loss(override=True)

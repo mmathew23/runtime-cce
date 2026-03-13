@@ -4,6 +4,8 @@ import json
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_cce_runtime import LEGACY_RUNTIME_VARIANT_ALIASES, SUPPORTED_RUNTIME_VARIANTS
+
 
 def bytes_per_dtype(dtype):
     return mx.array(0, dtype=dtype).itemsize
@@ -109,8 +111,14 @@ def main():
     parser.add_argument("--chunk-size", type=int, default=0)
     parser.add_argument(
         "--runtime-variant",
-        choices=["clean", "fused_finalize", "iter", "simd", "native_bridge"],
-        default="clean",
+        choices=[
+            *SUPPORTED_RUNTIME_VARIANTS,
+            *LEGACY_RUNTIME_VARIANT_ALIASES,
+            "native",
+            "native_bridge",
+            "native_custom_vjp",
+        ],
+        default="balanced",
     )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()

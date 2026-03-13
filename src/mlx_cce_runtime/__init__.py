@@ -6,6 +6,9 @@ from typing import Any
 import mlx.core as mx
 
 from .runtime_cce import (
+    LEGACY_RUNTIME_VARIANT_ALIASES,
+    RUNTIME_VARIANT_INFO,
+    SUPPORTED_RUNTIME_VARIANTS,
     make_chunked_cross_entropy_loss,
     make_runtime_cce_loss_fused_finalize,
 )
@@ -14,6 +17,9 @@ __all__ = [
     "install_mlx_fast_cce_loss",
     "make_chunked_cross_entropy_loss",
     "make_runtime_cce_loss_fused_finalize",
+    "SUPPORTED_RUNTIME_VARIANTS",
+    "RUNTIME_VARIANT_INFO",
+    "LEGACY_RUNTIME_VARIANT_ALIASES",
 ]
 
 
@@ -25,7 +31,7 @@ def _get_runtime_cce(
     ignore_index: int,
     logit_softcap: float,
     chunk_size: int,
-    runtime_variant: str = "clean",
+    runtime_variant: str = "balanced",
     quantized: bool = False,
     group_size: int | None = None,
     bits: int | None = None,
@@ -73,7 +79,7 @@ def install_mlx_fast_cce_loss(*, override: bool = False):
         if weight.ndim != 2:
             raise ValueError("weight must have exactly 2 dimensions")
 
-        runtime_variant = runtime_variant or os.environ.get("MLX_CCE_RUNTIME_VARIANT", "clean")
+        runtime_variant = runtime_variant or os.environ.get("MLX_CCE_RUNTIME_VARIANT", "balanced")
         hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
         targets_flat = targets.reshape((-1,)).astype(mx.int32)
 

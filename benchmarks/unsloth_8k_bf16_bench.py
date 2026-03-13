@@ -14,7 +14,7 @@ MODEL_NAME = "mlx-community/Llama-3.2-1B-Instruct-bf16"
 SEQ_LEN = 8192
 BATCH_SIZE = 1
 N_STEPS = 1
-RUNTIME_VARIANT = os.environ.get("MLX_CCE_RUNTIME_VARIANT", "clean")
+RUNTIME_VARIANT = os.environ.get("MLX_CCE_RUNTIME_VARIANT", "balanced")
 
 
 def make_dataset():
@@ -50,7 +50,17 @@ def make_batches(dataset, tokenizer):
     )
 
 
-def run(use_cce, model, tokenizer, dataset):
+def load_model():
+    return FastLanguageModel.from_pretrained(
+        model_name=MODEL_NAME,
+        max_seq_length=SEQ_LEN,
+        load_in_4bit=False,
+        full_finetuning=True,
+    )
+
+
+def run(use_cce, dataset):
+    model, tokenizer = load_model()
     model.value_and_grad = None
     mx.clear_cache()
     mx.reset_peak_memory()
@@ -86,13 +96,6 @@ def run(use_cce, model, tokenizer, dataset):
 
 def main():
     dataset = make_dataset()
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=MODEL_NAME,
-        max_seq_length=SEQ_LEN,
-        load_in_4bit=False,
-        full_finetuning=True,
-    )
-
     result = {
         "model": MODEL_NAME,
         "seq_len": SEQ_LEN,
@@ -100,12 +103,12 @@ def main():
         "runtime_variant": RUNTIME_VARIANT,
         "mlx_path": list(getattr(mlx, "__path__", [])),
         "core_file": mx.__file__,
-        "has_cce_kernel_before": hasattr(mx.fast, "cce_loss"),
+        "has_cce_kernel_before": hasattr(getattr(mlx, "fast", None), "cce_loss"),
         "has_cce_kernel_probe": has_cce_kernel(),
-        "has_cce_kernel_after": hasattr(mx.fast, "cce_loss"),
+        "has_cce_kernel_after": hasattr(getattr(mlx, "fast", None), "cce_loss"),
     }
-    result["baseline"] = run(False, model, tokenizer, dataset)
-    result["cce"] = run(True, model, tokenizer, dataset)
+    result["baseline"] = run(False, dataset)
+    result["cce"] = run(True, dataset)
     print(json.dumps(result, sort_keys=True))
 
 
