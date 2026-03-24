@@ -101,6 +101,42 @@ def _normalize_runtime_variant(runtime_variant: str) -> str:
         raise ValueError(f"Unsupported runtime_variant {runtime_variant!r}. Expected one of: {valid}.") from exc
 
 
+def _get_memory_budget() -> int:
+    """Return a per-chunk logit byte budget based on available hardware memory.
+
+    Two considerations in tension:
+      1. Smaller devices need aggressive chunking (more chunks, smaller each)
+         to avoid OOM.
+      2. The MLX scheduler benefits from small chunks regardless of device size
+         — but too many chunks incurs kernel-launch overhead.
+
+    We use 0.1% of the device's recommended working set as the budget, capped
+    at 128 MB.  The cap ensures the scheduler always gets enough granularity
+    (≥16 chunks for 128K vocab at any batch size ≤4), while the hardware
+    scaling ensures small devices chunk even more aggressively.
+
+      M4 Max 128GB → 103 GB recommended → min(103 MB, 128 MB) = 103 MB
+      M3 Pro 36GB  →  27 GB recommended → min(27 MB, 128 MB)  =  27 MB
+      M2 16GB      →  12 GB recommended → min(12 MB, 128 MB)  =  12 MB
+      M1 8GB       →   6 GB recommended → min(6 MB, 128 MB)   =   6 MB
+
+    Falls back to 128 MB if device info is unavailable.
+    """
+    try:
+        import mlx.core as _mx
+        info = _mx.device_info()
+        recommended = info.get("max_recommended_working_set_size", 0)
+        if recommended > 0:
+            hw_budget = int(recommended * 0.001)
+            return max(4 * 1024 * 1024, min(hw_budget, 128 * 1024 * 1024))
+    except Exception:
+        pass
+    return 128 * 1024 * 1024
+
+
+_CHUNK_BUDGET: int | None = None
+
+
 def _resolve_chunk_size(
     requested_chunk_size: int,
     n_tokens: int,
@@ -111,14 +147,37 @@ def _resolve_chunk_size(
     if requested_chunk_size > 0:
         return min(requested_chunk_size, vocab_size)
 
-    max_chunk_v = 16384 if n_tokens >= 2048 else 32768
-    min_chunk_v = 1024
-    budget_bytes = 256 * 1024 * 1024
-    max_chunk_from_budget = budget_bytes // (max(1, n_tokens) * max(1, bytes_per_element))
-    chunk_v = max(min_chunk_v, min(max_chunk_v, max_chunk_from_budget))
-    chunk_v = (chunk_v // 256) * 256
-    if chunk_v < min_chunk_v:
-        chunk_v = min(min_chunk_v, vocab_size)
+    global _CHUNK_BUDGET
+    if _CHUNK_BUDGET is None:
+        _CHUNK_BUDGET = _get_memory_budget()
+
+    # Goal: choose chunk_v so the MLX scheduler can free each chunk's logit
+    # tensor before the next chunk is computed, while keeping chunks large
+    # enough for efficient GEMM.
+    #
+    # Strategy: target 16 chunks as the baseline granularity.  The per-chunk
+    # byte budget (derived from hardware memory) caps how large each chunk can
+    # be.  On large-memory devices the cap is ~100 MB; on small devices it
+    # scales down to force more aggressive chunking.
+    #
+    # Constraints:
+    #   - min 2048 vocab entries per chunk  (GEMM efficiency floor)
+    #   - target 16 chunks                 (scheduler granularity sweet spot)
+    #   - per-chunk bytes ≤ hw budget       (adapts to device memory, ≤128 MB)
+
+    min_chunk_v = 2048
+    target_chunks = 16
+
+    # Compute chunk_v from target chunk count
+    chunk_v = (vocab_size + target_chunks - 1) // target_chunks
+
+    # Enforce per-chunk byte limit (adapts to hardware)
+    chunk_bytes = n_tokens * chunk_v * bytes_per_element
+    if chunk_bytes > _CHUNK_BUDGET and chunk_v > min_chunk_v:
+        chunk_v = max(min_chunk_v, _CHUNK_BUDGET // (max(1, n_tokens) * bytes_per_element))
+
+    # Align to 256 for Metal efficiency
+    chunk_v = max(min_chunk_v, (chunk_v // 256) * 256)
     return min(chunk_v, vocab_size)
 
 
